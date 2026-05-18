@@ -1,20 +1,33 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
+)
+
+const (
+	labelBot     = "listen.bot"
+	labelName    = "listen.name"
+	labelCreated = "listen.created"
+	labelValue   = "magnet"
 )
 
 type config struct {
@@ -61,6 +74,10 @@ var slashCommands = []*discordgo.ApplicationCommand{
 			},
 		},
 	},
+	{
+		Name:        "downloads",
+		Description: "List active and recent magnet downloads",
+	},
 }
 
 func main() {
@@ -89,6 +106,8 @@ func main() {
 		case "magnet":
 			link := data.Options[0].StringValue()
 			handleMagnet(s, i, docker, cfg, link)
+		case "downloads":
+			handleDownloads(s, i, docker)
 		}
 	})
 
@@ -174,11 +193,17 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 			Cmd: []string{
 				"--seed-time=0",
 				"--bt-stop-timeout=600",
-				"--summary-interval=0",
+				"--summary-interval=10",
+				"--enable-color=false",
 				"-d", "/downloads",
 				magnet,
 			},
-			Tty: true,
+			Tty: false,
+			Labels: map[string]string{
+				labelBot:     labelValue,
+				labelName:    magnetName(magnet),
+				labelCreated: time.Now().UTC().Format(time.RFC3339),
+			},
 		},
 		&container.HostConfig{
 			Binds:      []string{cfg.downloadHostPath + ":/downloads"},
@@ -189,11 +214,9 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 	if err != nil {
 		return 0, "", fmt.Errorf("create container: %w", err)
 	}
-	defer func() {
-		_ = cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
-	}()
 
 	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		_ = cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
 		return 0, "", fmt.Errorf("start container: %w", err)
 	}
 
@@ -208,21 +231,29 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 		exitCode = s.StatusCode
 	}
 
-	logs := readLogs(cli, resp.ID)
+	logs := readLogs(cli, resp.ID, "all")
 	return exitCode, logs, nil
 }
 
-func readLogs(cli *client.Client, id string) string {
+func readLogs(cli *client.Client, id string, tail string) string {
 	rc, err := cli.ContainerLogs(context.Background(), id, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
+		Tail:       tail,
 	})
 	if err != nil {
 		return ""
 	}
 	defer rc.Close()
-	buf, _ := io.ReadAll(rc)
-	return string(buf)
+	var out, errBuf bytes.Buffer
+	if _, err := stdcopy.StdCopy(&out, &errBuf, rc); err != nil {
+		return ""
+	}
+	if errBuf.Len() > 0 {
+		out.WriteByte('\n')
+		out.Write(errBuf.Bytes())
+	}
+	return out.String()
 }
 
 func tailLines(s string, n int) string {
@@ -231,4 +262,124 @@ func tailLines(s string, n int) string {
 		return strings.Join(lines, "\n")
 	}
 	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client) {
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	}); err != nil {
+		log.Printf("defer response: %v", err)
+		return
+	}
+
+	edit := func(content string) {
+		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
+			log.Printf("edit response: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	list, err := docker.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", labelBot+"="+labelValue)),
+	})
+	if err != nil {
+		edit(fmt.Sprintf("Failed to list downloads: %v", err))
+		return
+	}
+	if len(list) == 0 {
+		edit("No downloads.")
+		return
+	}
+
+	sort.Slice(list, func(a, b int) bool { return list[a].Created > list[b].Created })
+
+	const maxRows = 20
+	var b strings.Builder
+	b.WriteString("```\n")
+	for idx, c := range list {
+		if idx >= maxRows {
+			break
+		}
+		name := c.Labels[labelName]
+		if name == "" {
+			name = "magnet"
+		}
+		fmt.Fprintf(&b, "%s\n  %s\n", truncate(name, 70), formatStatus(ctx, docker, c.ID, c.State, c.Status))
+	}
+	b.WriteString("```")
+	if len(list) > maxRows {
+		fmt.Fprintf(&b, "\n_…and %d more_", len(list)-maxRows)
+	}
+	edit(b.String())
+}
+
+func formatStatus(ctx context.Context, cli *client.Client, id, state, statusStr string) string {
+	if state == "running" {
+		if p := readProgress(ctx, cli, id); p != "" {
+			return "running — " + p
+		}
+		return "running (waiting for metadata)"
+	}
+	return statusStr
+}
+
+var progressRe = regexp.MustCompile(`\[#\w+\s+(\S+)/(\S+)\((\d+)%\)[^\]]*?DL:(\S+?)(?:\s+UL:\S+)?(?:\s+ETA:([^\]\s]+))?\]`)
+
+func readProgress(ctx context.Context, cli *client.Client, id string) string {
+	logCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rc, err := cli.ContainerLogs(logCtx, id, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       "200",
+	})
+	if err != nil {
+		return ""
+	}
+	defer rc.Close()
+	var out, errBuf bytes.Buffer
+	if _, err := stdcopy.StdCopy(&out, &errBuf, rc); err != nil {
+		return ""
+	}
+	text := out.String() + "\n" + errBuf.String()
+	lines := strings.Split(text, "\n")
+	for j := len(lines) - 1; j >= 0; j-- {
+		if m := progressRe.FindStringSubmatch(lines[j]); m != nil {
+			eta := m[5]
+			if eta == "" {
+				eta = "?"
+			}
+			return fmt.Sprintf("%s%% (%s/%s) DL %s ETA %s", m[3], m[1], m[2], m[4], eta)
+		}
+	}
+	return ""
+}
+
+func magnetName(link string) string {
+	u, err := url.Parse(link)
+	if err != nil {
+		return "magnet"
+	}
+	q := u.Query()
+	if dn := q.Get("dn"); dn != "" {
+		return dn
+	}
+	if xt := q.Get("xt"); strings.HasPrefix(xt, "urn:btih:") {
+		h := strings.TrimPrefix(xt, "urn:btih:")
+		if len(h) > 12 {
+			h = h[:12]
+		}
+		return "btih:" + h
+	}
+	return "magnet"
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
