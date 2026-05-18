@@ -5,13 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 )
@@ -64,12 +66,12 @@ func loadConfig() (*config, error) {
 var slashCommands = []*discordgo.ApplicationCommand{
 	{
 		Name:        "magnet",
-		Description: "Download a torrent from a magnet link into the shared folder",
+		Description: "Download one or more torrents from magnet links",
 		Options: []*discordgo.ApplicationCommandOption{
 			{
 				Type:        discordgo.ApplicationCommandOptionString,
-				Name:        "link",
-				Description: "The magnet: URI",
+				Name:        "links",
+				Description: "One or more magnet: URIs, separated by spaces or newlines",
 				Required:    true,
 			},
 		},
@@ -80,21 +82,55 @@ var slashCommands = []*discordgo.ApplicationCommand{
 	},
 }
 
+func setupLogging() {
+	level := slog.LevelInfo
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+}
+
+func interactionUser(i *discordgo.InteractionCreate) string {
+	if i.Member != nil && i.Member.User != nil {
+		return i.Member.User.Username
+	}
+	if i.User != nil {
+		return i.User.Username
+	}
+	return "unknown"
+}
+
 func main() {
+	setupLogging()
+
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("config", "err", err)
+		os.Exit(1)
 	}
 
 	docker, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Fatalf("docker client: %v", err)
+		slog.Error("docker client", "err", err)
+		os.Exit(1)
 	}
 	defer docker.Close()
 
+	if ping, err := docker.Ping(context.Background()); err != nil {
+		slog.Warn("docker ping failed; check DOCKER_HOST / proxy", "err", err)
+	} else {
+		slog.Info("connected to docker", "api_version", ping.APIVersion)
+	}
+
 	dg, err := discordgo.New("Bot " + cfg.token)
 	if err != nil {
-		log.Fatalf("discord client: %v", err)
+		slog.Error("discord client", "err", err)
+		os.Exit(1)
 	}
 
 	dg.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -102,6 +138,11 @@ func main() {
 			return
 		}
 		data := i.ApplicationCommandData()
+		slog.Info("command received",
+			"command", data.Name,
+			"user", interactionUser(i),
+			"guild", i.GuildID,
+		)
 		switch data.Name {
 		case "magnet":
 			link := data.Options[0].StringValue()
@@ -112,34 +153,89 @@ func main() {
 	})
 
 	if err := dg.Open(); err != nil {
-		log.Fatalf("open discord session: %v", err)
+		slog.Error("open discord session", "err", err)
+		os.Exit(1)
 	}
 	defer dg.Close()
 
-	log.Println("registering slash commands...")
 	registered, err := dg.ApplicationCommandBulkOverwrite(cfg.appID, cfg.guildID, slashCommands)
 	if err != nil {
-		log.Fatalf("register commands: %v", err)
+		slog.Error("register commands", "err", err)
+		os.Exit(1)
 	}
-	scope := "globally"
+	scope := "global"
 	if cfg.guildID != "" {
-		scope = "in guild " + cfg.guildID
+		scope = "guild:" + cfg.guildID
 	}
-	log.Printf("registered %d command(s) %s", len(registered), scope)
+	slog.Info("slash commands registered", "count", len(registered), "scope", scope)
 
-	log.Println("bot is running. Ctrl+C to stop.")
+	slog.Info("bot running; Ctrl+C to stop")
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	log.Println("shutting down")
+	slog.Info("shutting down")
 }
 
-func handleMagnet(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client, cfg *config, link string) {
-	if !strings.HasPrefix(link, "magnet:?") {
+func extractMagnets(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ' ' || r == '\n' || r == '\t' || r == '\r'
+	})
+	seen := make(map[string]bool)
+	var out []string
+	for _, f := range fields {
+		if strings.HasPrefix(f, "magnet:?") && !seen[f] {
+			seen[f] = true
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+type magnetJob struct {
+	name   string
+	status string
+	done   bool
+	ok     bool
+}
+
+func magnetEmbed(jobs []*magnetJob) *discordgo.MessageEmbed {
+	done, failed := 0, 0
+	var b strings.Builder
+	for _, j := range jobs {
+		icon := "⏳"
+		if j.done {
+			if j.ok {
+				icon = "✅"
+				done++
+			} else {
+				icon = "❌"
+				failed++
+			}
+		}
+		fmt.Fprintf(&b, "%s **%s**\n%s\n", icon, truncate(j.name, 80), j.status)
+	}
+	color := 0x5865F2
+	if done+failed == len(jobs) {
+		color = 0x57F287
+		if failed > 0 {
+			color = 0xED4245
+		}
+	}
+	return &discordgo.MessageEmbed{
+		Title:       fmt.Sprintf("Downloads — %d/%d complete", done, len(jobs)),
+		Description: b.String(),
+		Color:       color,
+		Timestamp:   time.Now().Format(time.RFC3339),
+	}
+}
+
+func handleMagnet(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client, cfg *config, raw string) {
+	magnets := extractMagnets(raw)
+	if len(magnets) == 0 {
 		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "That doesn't look like a magnet link.",
+				Content: "No magnet links found. Paste one or more `magnet:?...` URIs separated by spaces or newlines.",
 				Flags:   discordgo.MessageFlagsEphemeral,
 			},
 		})
@@ -149,40 +245,86 @@ func handleMagnet(s *discordgo.Session, i *discordgo.InteractionCreate, docker *
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	}); err != nil {
-		log.Printf("defer response: %v", err)
+		slog.Error("defer response", "err", err)
 		return
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
-		defer cancel()
+	jobs := make([]*magnetJob, len(magnets))
+	for idx, m := range magnets {
+		jobs[idx] = &magnetJob{name: magnetName(m), status: "queued"}
+	}
 
-		edit := func(content string) {
-			if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
-				log.Printf("edit response: %v", err)
+	var mu sync.Mutex
+	render := func() {
+		mu.Lock()
+		embed := magnetEmbed(jobs)
+		mu.Unlock()
+		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Embeds: &[]*discordgo.MessageEmbed{embed},
+		}); err != nil {
+			slog.Error("edit response", "err", err)
+		}
+	}
+	set := func(idx int, status string, done, ok bool) {
+		mu.Lock()
+		jobs[idx].status = status
+		jobs[idx].done = done
+		jobs[idx].ok = ok
+		mu.Unlock()
+		render()
+	}
+
+	slog.Info("magnet command", "count", len(magnets))
+	render()
+
+	var wg sync.WaitGroup
+	for idx, m := range magnets {
+		wg.Add(1)
+		go func(idx int, m string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+			defer cancel()
+
+			name := jobs[idx].name
+			set(idx, "starting…", false, false)
+			start := time.Now()
+			exitCode, logs, err := runDownloader(ctx, docker, cfg, m)
+			switch {
+			case err != nil:
+				slog.Error("download error", "err", err, "name", name)
+				set(idx, fmt.Sprintf("failed: %v", err), true, false)
+			case exitCode == 0:
+				dur := time.Since(start).Round(time.Second).String()
+				slog.Info("download complete", "name", name, "duration", dur)
+				set(idx, "complete in "+dur, true, true)
+			default:
+				slog.Warn("download exited non-zero", "name", name, "exit_code", exitCode)
+				set(idx, fmt.Sprintf("failed (exit %d): %s", exitCode, lastNonEmptyLine(logs)), true, false)
 			}
-		}
+		}(idx, m)
+	}
+	wg.Wait()
+}
 
-		edit("Starting download...")
-		exitCode, logs, err := runDownloader(ctx, docker, cfg, link)
-		if err != nil {
-			edit(fmt.Sprintf("Download failed: %v", err))
-			return
+func lastNonEmptyLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\r\n"), "\n")
+	for j := len(lines) - 1; j >= 0; j-- {
+		if t := strings.TrimSpace(lines[j]); t != "" {
+			return truncate(t, 200)
 		}
-		if exitCode == 0 {
-			edit("Download complete.")
-			return
-		}
-		edit(fmt.Sprintf("Download failed (exit %d):\n```\n%s\n```", exitCode, tailLines(logs, 20)))
-	}()
+	}
+	return ""
 }
 
 func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet string) (int64, string, error) {
 	if _, err := cli.ImageInspect(ctx, cfg.downloaderImage); err != nil {
+		slog.Debug("downloader image not present locally; attempting pull", "image", cfg.downloaderImage)
 		pullCtx, pullCancel := context.WithTimeout(ctx, 2*time.Minute)
 		if rc, perr := cli.ImagePull(pullCtx, cfg.downloaderImage, image.PullOptions{}); perr == nil {
 			_, _ = io.Copy(io.Discard, rc)
 			_ = rc.Close()
+		} else {
+			slog.Debug("image pull failed (expected for locally-built images)", "image", cfg.downloaderImage, "err", perr)
 		}
 		pullCancel()
 	}
@@ -206,7 +348,11 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 			},
 		},
 		&container.HostConfig{
-			Binds:      []string{cfg.downloadHostPath + ":/downloads"},
+			Mounts: []mount.Mount{{
+				Type:   mount.TypeBind,
+				Source: cfg.downloadHostPath,
+				Target: "/downloads",
+			}},
 			AutoRemove: false,
 		},
 		nil, nil, "",
@@ -214,11 +360,13 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 	if err != nil {
 		return 0, "", fmt.Errorf("create container: %w", err)
 	}
+	slog.Info("container created", "id", resp.ID[:12], "image", cfg.downloaderImage)
 
 	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		_ = cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
 		return 0, "", fmt.Errorf("start container: %w", err)
 	}
+	slog.Info("container started", "id", resp.ID[:12])
 
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	var exitCode int64
@@ -268,13 +416,20 @@ func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docke
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	}); err != nil {
-		log.Printf("defer response: %v", err)
+		slog.Error("defer response", "err", err)
 		return
 	}
 
-	edit := func(content string) {
+	editContent := func(content string) {
 		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
-			log.Printf("edit response: %v", err)
+			slog.Error("edit response", "err", err)
+		}
+	}
+	editEmbed := func(e *discordgo.MessageEmbed) {
+		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Embeds: &[]*discordgo.MessageEmbed{e},
+		}); err != nil {
+			slog.Error("edit response", "err", err)
 		}
 	}
 
@@ -286,19 +441,24 @@ func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docke
 		Filters: filters.NewArgs(filters.Arg("label", labelBot+"="+labelValue)),
 	})
 	if err != nil {
-		edit(fmt.Sprintf("Failed to list downloads: %v", err))
+		slog.Error("list downloads", "err", err)
+		editContent(fmt.Sprintf("Failed to list downloads: %v", err))
 		return
 	}
+	slog.Info("downloads listed", "count", len(list))
 	if len(list) == 0 {
-		edit("No downloads.")
+		editContent("No downloads yet.")
 		return
 	}
 
 	sort.Slice(list, func(a, b int) bool { return list[a].Created > list[b].Created })
 
-	const maxRows = 20
-	var b strings.Builder
-	b.WriteString("```\n")
+	const maxRows = 25
+	running, completed := 0, 0
+	embed := &discordgo.MessageEmbed{
+		Color:     0x5865F2,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
 	for idx, c := range list {
 		if idx >= maxRows {
 			break
@@ -307,13 +467,24 @@ func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docke
 		if name == "" {
 			name = "magnet"
 		}
-		fmt.Fprintf(&b, "%s\n  %s\n", truncate(name, 70), formatStatus(ctx, docker, c.ID, c.State, c.Status))
+		status := formatStatus(ctx, docker, c.ID, c.State, c.Status)
+		if c.State == "running" {
+			running++
+		} else if strings.HasPrefix(c.Status, "Exited (0)") {
+			completed++
+		}
+		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+			Name:  truncate(name, 256),
+			Value: truncate(status, 1024),
+		})
 	}
-	b.WriteString("```")
+	embed.Title = fmt.Sprintf("Downloads — %d running, %d done, %d total", running, completed, len(list))
 	if len(list) > maxRows {
-		fmt.Fprintf(&b, "\n_…and %d more_", len(list)-maxRows)
+		embed.Footer = &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("…and %d more not shown", len(list)-maxRows),
+		}
 	}
-	edit(b.String())
+	editEmbed(embed)
 }
 
 func formatStatus(ctx context.Context, cli *client.Client, id, state, statusStr string) string {
