@@ -80,6 +80,10 @@ var slashCommands = []*discordgo.ApplicationCommand{
 		Name:        "downloads",
 		Description: "List active and recent magnet downloads",
 	},
+	{
+		Name:        "clear",
+		Description: "Remove finished (non-running) download containers",
+	},
 }
 
 func setupLogging() {
@@ -149,6 +153,8 @@ func main() {
 			handleMagnet(s, i, docker, cfg, link)
 		case "downloads":
 			handleDownloads(s, i, docker)
+		case "clear":
+			handleClear(s, i, docker)
 		}
 	})
 
@@ -355,7 +361,8 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 			}},
 			AutoRemove: false,
 		},
-		nil, nil, "",
+		nil, nil,
+		fmt.Sprintf("listen-dl-%d", time.Now().UnixNano()),
 	)
 	if err != nil {
 		return 0, "", fmt.Errorf("create container: %w", err)
@@ -485,6 +492,57 @@ func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docke
 		}
 	}
 	editEmbed(embed)
+}
+
+func handleClear(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client) {
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	}); err != nil {
+		slog.Error("defer response", "err", err)
+		return
+	}
+	edit := func(content string) {
+		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
+			slog.Error("edit response", "err", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	list, err := docker.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", labelBot+"="+labelValue)),
+	})
+	if err != nil {
+		slog.Error("clear: list", "err", err)
+		edit(fmt.Sprintf("Failed to list downloads: %v", err))
+		return
+	}
+
+	removed, skipped, failed := 0, 0, 0
+	for _, c := range list {
+		if c.State == "running" || c.State == "restarting" || c.State == "paused" {
+			skipped++
+			continue
+		}
+		if err := docker.ContainerRemove(ctx, c.ID, container.RemoveOptions{}); err != nil {
+			slog.Error("clear: remove", "id", c.ID[:12], "err", err)
+			failed++
+			continue
+		}
+		removed++
+	}
+	slog.Info("clear done", "removed", removed, "skipped_active", skipped, "failed", failed)
+
+	msg := fmt.Sprintf("Removed **%d** finished container(s).", removed)
+	if skipped > 0 {
+		msg += fmt.Sprintf(" Left %d still running.", skipped)
+	}
+	if failed > 0 {
+		msg += fmt.Sprintf(" %d could not be removed (see logs).", failed)
+	}
+	edit(msg)
 }
 
 func formatStatus(ctx context.Context, cli *client.Client, id, state, statusStr string) string {
