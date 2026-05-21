@@ -468,19 +468,43 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 	}
 	slog.Info("container started", "id", resp.ID[:12])
 
-	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	var exitCode int64
-	select {
-	case werr := <-errCh:
-		if werr != nil {
-			return 0, "", fmt.Errorf("wait container: %w", werr)
-		}
-	case s := <-statusCh:
-		exitCode = s.StatusCode
+	exitCode, err := waitForExit(ctx, cli, resp.ID)
+	if err != nil {
+		return 0, "", fmt.Errorf("wait container: %w", err)
 	}
 
 	logs := readLogs(cli, resp.ID, "all")
 	return exitCode, logs, nil
+}
+
+// waitForExit polls the container state until it stops, instead of holding a
+// single long-lived ContainerWait connection — that connection sits idle for
+// the whole download and gets reaped by the docker-socket-proxy's HAProxy
+// idle timeout. Short inspect calls tolerate proxy hiccups and reconnects.
+func waitForExit(ctx context.Context, cli *client.Client, id string) (int64, error) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	consecutiveErrs := 0
+	for {
+		info, err := cli.ContainerInspect(ctx, id)
+		if err != nil {
+			consecutiveErrs++
+			if consecutiveErrs >= 5 {
+				return 0, fmt.Errorf("inspect: %w", err)
+			}
+			slog.Warn("container inspect failed; retrying", "id", id[:12], "attempt", consecutiveErrs, "err", err)
+		} else {
+			consecutiveErrs = 0
+			if info.State != nil && !info.State.Running {
+				return int64(info.State.ExitCode), nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func readLogs(cli *client.Client, id string, tail string) string {
@@ -730,16 +754,10 @@ func isFailed(c container.Summary) bool {
 }
 
 func watchAndNotify(s *discordgo.Session, docker *client.Client, id, name, channelID, userID string) {
-	statusCh, errCh := docker.ContainerWait(context.Background(), id, container.WaitConditionNotRunning)
-	var exitCode int64
-	select {
-	case werr := <-errCh:
-		if werr != nil {
-			slog.Error("restart watch", "err", werr, "name", name)
-			return
-		}
-	case st := <-statusCh:
-		exitCode = st.StatusCode
+	exitCode, err := waitForExit(context.Background(), docker, id)
+	if err != nil {
+		slog.Error("restart watch", "err", err, "name", name)
+		return
 	}
 
 	var content string
