@@ -108,6 +108,10 @@ var slashCommands = []*discordgo.ApplicationCommand{
 		Name:        "clear",
 		Description: "Remove finished (non-running) download containers",
 	},
+	{
+		Name:        "restart",
+		Description: "Restart all failed downloads (resumes from partial files)",
+	},
 }
 
 func setupLogging() {
@@ -131,6 +135,16 @@ func interactionUser(i *discordgo.InteractionCreate) string {
 		return i.User.Username
 	}
 	return "unknown"
+}
+
+func interactionUserID(i *discordgo.InteractionCreate) string {
+	if i.Member != nil && i.Member.User != nil {
+		return i.Member.User.ID
+	}
+	if i.User != nil {
+		return i.User.ID
+	}
+	return ""
 }
 
 func main() {
@@ -179,6 +193,8 @@ func main() {
 			handleDownloads(s, i, docker)
 		case "clear":
 			handleClear(s, i, docker)
+		case "restart":
+			handleRestart(s, i, docker)
 		}
 	})
 
@@ -334,6 +350,54 @@ func handleMagnet(s *discordgo.Session, i *discordgo.InteractionCreate, docker *
 		}(idx, m)
 	}
 	wg.Wait()
+
+	ok, failed := 0, 0
+	var failedNames []string
+	mu.Lock()
+	for _, j := range jobs {
+		if j.ok {
+			ok++
+		} else {
+			failed++
+			failedNames = append(failedNames, j.name)
+		}
+	}
+	mu.Unlock()
+	sendCompletionNotice(s, i, ok, failed, failedNames)
+}
+
+func sendCompletionNotice(s *discordgo.Session, i *discordgo.InteractionCreate, ok, failed int, failedNames []string) {
+	uid := interactionUserID(i)
+	var content string
+	var allowed *discordgo.MessageAllowedMentions
+	if failed > 0 {
+		shown := failedNames
+		extra := 0
+		if len(shown) > 5 {
+			extra = len(shown) - 5
+			shown = shown[:5]
+		}
+		summary := fmt.Sprintf("❌ %d of %d download(s) failed: %s", failed, failed+ok, strings.Join(shown, ", "))
+		if extra > 0 {
+			summary += fmt.Sprintf(" (+%d more)", extra)
+		}
+		if uid != "" {
+			content = "<@" + uid + "> " + summary
+			allowed = &discordgo.MessageAllowedMentions{Users: []string{uid}}
+		} else {
+			content = summary
+			allowed = &discordgo.MessageAllowedMentions{}
+		}
+	} else {
+		content = fmt.Sprintf("✅ %d download(s) complete.", ok)
+		allowed = &discordgo.MessageAllowedMentions{}
+	}
+	if _, err := s.ChannelMessageSendComplex(i.ChannelID, &discordgo.MessageSend{
+		Content:         content,
+		AllowedMentions: allowed,
+	}); err != nil {
+		slog.Error("completion notice", "err", err)
+	}
 }
 
 func lastNonEmptyLine(s string) string {
@@ -572,6 +636,132 @@ func handleClear(s *discordgo.Session, i *discordgo.InteractionCreate, docker *c
 		msg += fmt.Sprintf(" %d could not be removed (see logs).", failed)
 	}
 	edit(msg)
+}
+
+var exitCodeRe = regexp.MustCompile(`Exited \((\d+)\)`)
+
+func handleRestart(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client) {
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	}); err != nil {
+		slog.Error("defer response", "err", err)
+		return
+	}
+	edit := func(content string) {
+		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
+			slog.Error("edit response", "err", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	list, err := docker.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", labelBot+"="+labelValue)),
+	})
+	if err != nil {
+		slog.Error("restart: list", "err", err)
+		edit(fmt.Sprintf("Failed to list downloads: %v", err))
+		return
+	}
+
+	channelID := i.ChannelID
+	userID := interactionUserID(i)
+
+	restarted, skipped := 0, 0
+	var restartedNames []string
+	var failures []string
+	for _, c := range list {
+		if !isFailed(c) {
+			skipped++
+			continue
+		}
+		name := c.Labels[labelName]
+		if name == "" {
+			name = c.ID[:12]
+		}
+		if err := docker.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
+			slog.Error("restart: start", "id", c.ID[:12], "err", err)
+			failures = append(failures, fmt.Sprintf("%s (%v)", name, err))
+			continue
+		}
+		slog.Info("restarted", "id", c.ID[:12], "name", name)
+		restarted++
+		restartedNames = append(restartedNames, name)
+		go watchAndNotify(s, docker, c.ID, name, channelID, userID)
+	}
+
+	if restarted == 0 && len(failures) == 0 {
+		edit(fmt.Sprintf("No failed downloads to restart (%d not eligible).", skipped))
+		return
+	}
+
+	msg := fmt.Sprintf("Restarted **%d** failed download(s).", restarted)
+	if len(restartedNames) > 0 {
+		shown := restartedNames
+		extra := 0
+		if len(shown) > 5 {
+			extra = len(shown) - 5
+			shown = shown[:5]
+		}
+		msg += "\n• " + strings.Join(shown, "\n• ")
+		if extra > 0 {
+			msg += fmt.Sprintf("\n…and %d more", extra)
+		}
+	}
+	if len(failures) > 0 {
+		msg += fmt.Sprintf("\n\n%d could not be started:\n• %s", len(failures), strings.Join(failures, "\n• "))
+	}
+	edit(msg)
+}
+
+func isFailed(c container.Summary) bool {
+	switch c.State {
+	case "running", "restarting", "paused", "removing":
+		return false
+	case "created", "dead":
+		return true
+	}
+	if m := exitCodeRe.FindStringSubmatch(c.Status); m != nil {
+		return m[1] != "0"
+	}
+	return false
+}
+
+func watchAndNotify(s *discordgo.Session, docker *client.Client, id, name, channelID, userID string) {
+	statusCh, errCh := docker.ContainerWait(context.Background(), id, container.WaitConditionNotRunning)
+	var exitCode int64
+	select {
+	case werr := <-errCh:
+		if werr != nil {
+			slog.Error("restart watch", "err", werr, "name", name)
+			return
+		}
+	case st := <-statusCh:
+		exitCode = st.StatusCode
+	}
+
+	var content string
+	var allowed *discordgo.MessageAllowedMentions
+	if exitCode == 0 {
+		content = fmt.Sprintf("✅ Restart complete: %s", name)
+		allowed = &discordgo.MessageAllowedMentions{}
+		slog.Info("restart complete", "name", name)
+	} else if userID != "" {
+		content = fmt.Sprintf("<@%s> ❌ Restart failed again (exit %d): %s", userID, exitCode, name)
+		allowed = &discordgo.MessageAllowedMentions{Users: []string{userID}}
+		slog.Warn("restart failed again", "name", name, "exit_code", exitCode)
+	} else {
+		content = fmt.Sprintf("❌ Restart failed again (exit %d): %s", exitCode, name)
+		allowed = &discordgo.MessageAllowedMentions{}
+	}
+	if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+		Content:         content,
+		AllowedMentions: allowed,
+	}); err != nil {
+		slog.Error("restart notice", "err", err)
+	}
 }
 
 func formatStatus(ctx context.Context, cli *client.Client, id, state, statusStr string) string {
