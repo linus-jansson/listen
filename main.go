@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,12 +33,25 @@ const (
 	labelValue   = "magnet"
 )
 
+const defaultTrackers = "udp://tracker.opentrackr.org:1337/announce," +
+	"udp://open.tracker.cl:1337/announce," +
+	"udp://open.demonii.com:1337/announce," +
+	"udp://exodus.desync.com:6969/announce," +
+	"udp://tracker.openbittorrent.com:6969/announce," +
+	"udp://opentracker.i2p.rocks:6969/announce," +
+	"udp://tracker.torrent.eu.org:451/announce," +
+	"udp://open.stealth.si:80/announce," +
+	"udp://tracker.tiny-vps.com:6969/announce," +
+	"http://tracker.openbittorrent.com:80/announce"
+
 type config struct {
 	token            string
 	appID            string
 	guildID          string
 	downloadHostPath string
 	downloaderImage  string
+	btStopTimeout    int
+	btTrackers       string
 }
 
 func loadConfig() (*config, error) {
@@ -47,6 +61,8 @@ func loadConfig() (*config, error) {
 		guildID:          os.Getenv("DISCORD_GUILD_ID"),
 		downloadHostPath: os.Getenv("DOWNLOAD_HOST_PATH"),
 		downloaderImage:  os.Getenv("DOWNLOADER_IMAGE"),
+		btStopTimeout:    600,
+		btTrackers:       defaultTrackers,
 	}
 	if c.token == "" {
 		return nil, fmt.Errorf("DISCORD_TOKEN is required")
@@ -59,6 +75,14 @@ func loadConfig() (*config, error) {
 	}
 	if c.downloaderImage == "" {
 		c.downloaderImage = "listen-downloader:latest"
+	}
+	if v := os.Getenv("BT_STOP_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.btStopTimeout = n
+		}
+	}
+	if v := os.Getenv("BT_TRACKERS"); v != "" {
+		c.btTrackers = v
 	}
 	return c, nil
 }
@@ -340,9 +364,14 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 			Image: cfg.downloaderImage,
 			Cmd: []string{
 				"--seed-time=0",
-				"--bt-stop-timeout=600",
+				fmt.Sprintf("--bt-stop-timeout=%d", cfg.btStopTimeout),
 				"--summary-interval=10",
 				"--enable-color=false",
+				"--enable-dht=true",
+				"--enable-dht6=true",
+				"--bt-enable-lpd=true",
+				"--enable-peer-exchange=true",
+				"--bt-tracker=" + cfg.btTrackers,
 				"-d", "/downloads",
 				magnet,
 			},
@@ -550,12 +579,15 @@ func formatStatus(ctx context.Context, cli *client.Client, id, state, statusStr 
 		if p := readProgress(ctx, cli, id); p != "" {
 			return "running — " + p
 		}
-		return "running (waiting for metadata)"
+		return "running (starting up)"
 	}
 	return statusStr
 }
 
-var progressRe = regexp.MustCompile(`\[#\w+\s+(\S+)/(\S+)\((\d+)%\)[^\]]*?DL:(\S+?)(?:\s+UL:\S+)?(?:\s+ETA:([^\]\s]+))?\]`)
+var (
+	progressRe = regexp.MustCompile(`\[#\w+\s+(\S+)/(\S+)\((\d+)%\)[^\]]*?DL:(\S+?)(?:\s+UL:\S+)?(?:\s+ETA:([^\]\s]+))?\]`)
+	metadataRe = regexp.MustCompile(`\[#\w+\s+0B/0B\s+CN:(\d+)\s+SD:\d+\s+DL:\S+\]`)
+)
 
 func readProgress(ctx context.Context, cli *client.Client, id string) string {
 	logCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -576,12 +608,21 @@ func readProgress(ctx context.Context, cli *client.Client, id string) string {
 	text := out.String() + "\n" + errBuf.String()
 	lines := strings.Split(text, "\n")
 	for j := len(lines) - 1; j >= 0; j-- {
-		if m := progressRe.FindStringSubmatch(lines[j]); m != nil {
+		line := lines[j]
+		if m := progressRe.FindStringSubmatch(line); m != nil {
 			eta := m[5]
 			if eta == "" {
 				eta = "?"
 			}
 			return fmt.Sprintf("%s%% (%s/%s) DL %s ETA %s", m[3], m[1], m[2], m[4], eta)
+		}
+		if m := metadataRe.FindStringSubmatch(line); m != nil {
+			conns := m[1]
+			suffix := ""
+			if strings.Contains(text, "info hash is not authorized") {
+				suffix = " (private tracker — auth required)"
+			}
+			return fmt.Sprintf("fetching metadata, %s peer(s)%s", conns, suffix)
 		}
 	}
 	return ""

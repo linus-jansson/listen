@@ -24,6 +24,8 @@ services:
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
       DOWNLOAD_HOST_PATH: ${DOWNLOAD_HOST_PATH:?DOWNLOAD_HOST_PATH required}
       DOWNLOADER_IMAGE: ${DOWNLOADER_IMAGE:-listen-downloader:latest}
+      BT_STOP_TIMEOUT: ${BT_STOP_TIMEOUT:-}
+      BT_TRACKERS: ${BT_TRACKERS:-}
     depends_on:
       - docker-proxy
     networks:
