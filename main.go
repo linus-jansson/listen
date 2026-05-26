@@ -112,6 +112,18 @@ var slashCommands = []*discordgo.ApplicationCommand{
 		Name:        "restart",
 		Description: "Restart all failed downloads (resumes from partial files)",
 	},
+	{
+		Name:        "search",
+		Description: "Search for torrents by name",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        "query",
+				Description: "What to search for",
+				Required:    true,
+			},
+		},
+	},
 }
 
 func setupLogging() {
@@ -176,25 +188,34 @@ func main() {
 	}
 
 	dg.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		if i.Type != discordgo.InteractionApplicationCommand {
-			return
-		}
-		data := i.ApplicationCommandData()
-		slog.Info("command received",
-			"command", data.Name,
-			"user", interactionUser(i),
-			"guild", i.GuildID,
-		)
-		switch data.Name {
-		case "magnet":
-			link := data.Options[0].StringValue()
-			handleMagnet(s, i, docker, cfg, link)
-		case "downloads":
-			handleDownloads(s, i, docker)
-		case "clear":
-			handleClear(s, i, docker)
-		case "restart":
-			handleRestart(s, i, docker)
+		switch i.Type {
+		case discordgo.InteractionApplicationCommand:
+			data := i.ApplicationCommandData()
+			slog.Info("command received",
+				"command", data.Name,
+				"user", interactionUser(i),
+				"guild", i.GuildID,
+			)
+			switch data.Name {
+			case "magnet":
+				link := data.Options[0].StringValue()
+				handleMagnet(s, i, docker, cfg, link)
+			case "search":
+				query := data.Options[0].StringValue()
+				handleSearch(s, i, cfg, query)
+			case "downloads":
+				handleDownloads(s, i, docker)
+			case "clear":
+				handleClear(s, i, docker)
+			case "restart":
+				handleRestart(s, i, docker)
+			}
+		case discordgo.InteractionMessageComponent:
+			data := i.MessageComponentData()
+			slog.Info("component", "id", data.CustomID, "user", interactionUser(i))
+			if strings.HasPrefix(data.CustomID, "srch_") {
+				handleSearchComponent(s, i, docker, cfg)
+			}
 		}
 	})
 
