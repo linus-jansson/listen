@@ -31,10 +31,11 @@ type tpbResult struct {
 }
 
 type searchSession struct {
-	Results []tpbResult
-	Page    int
-	Query   string
-	Created time.Time
+	Results     []tpbResult
+	Page        int
+	Query       string
+	Created     time.Time
+	OwnerUserID string
 }
 
 var (
@@ -224,7 +225,7 @@ func handleSearch(s *discordgo.Session, i *discordgo.InteractionCreate, cfg *con
 	go pruneSearchSessions()
 
 	sessionID := newSessionID()
-	sess := &searchSession{Results: results, Page: 0, Query: query, Created: time.Now()}
+	sess := &searchSession{Results: results, Page: 0, Query: query, Created: time.Now(), OwnerUserID: interactionUserID(i)}
 	searchSessionsMu.Lock()
 	searchSessions[sessionID] = sess
 	searchSessionsMu.Unlock()
@@ -245,6 +246,24 @@ func handleSearchNav(s *discordgo.Session, i *discordgo.InteractionCreate, sessi
 	var results []tpbResult
 	var page int
 	var query string
+	if ok {
+		// Check TTL expiry
+		if time.Since(sess.Created) > searchSessionTTL {
+			delete(searchSessions, sessionID)
+			ok = false
+		} else if sess.OwnerUserID != interactionUserID(i) {
+			// Check ownership
+			searchSessionsMu.Unlock()
+			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "You don't have permission to use this search session.",
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			})
+			return
+		}
+	}
 	if ok {
 		totalPages := (len(sess.Results) + searchPageSize - 1) / searchPageSize
 		newPage := sess.Page + delta
@@ -295,11 +314,31 @@ func handleSearchDownload(s *discordgo.Session, i *discordgo.InteractionCreate, 
 	sess, ok := searchSessions[sessionID]
 	var result tpbResult
 	if ok {
-		globalIdx := sess.Page*searchPageSize + localIdx
-		if globalIdx < len(sess.Results) {
-			result = sess.Results[globalIdx]
-		} else {
+		// Check TTL expiry
+		if time.Since(sess.Created) > searchSessionTTL {
+			delete(searchSessions, sessionID)
 			ok = false
+		} else if sess.OwnerUserID != interactionUserID(i) {
+			// Check ownership
+			searchSessionsMu.Unlock()
+			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "You don't have permission to use this search session.",
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			})
+			return
+		} else if localIdx < 0 {
+			// Reject negative indices
+			ok = false
+		} else {
+			globalIdx := sess.Page*searchPageSize + localIdx
+			if globalIdx < 0 || globalIdx >= len(sess.Results) {
+				ok = false
+			} else {
+				result = sess.Results[globalIdx]
+			}
 		}
 	}
 	searchSessionsMu.Unlock()
@@ -348,7 +387,10 @@ func handleSearchDownload(s *discordgo.Session, i *discordgo.InteractionCreate, 
 			msg = fmt.Sprintf("❌ **%s** — exit %d: %s", truncate(name, 80), exitCode, lastNonEmptyLine(logs))
 		}
 
-		if _, err := s.ChannelMessageSend(channelID, msg); err != nil {
+		if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
+			Content:         msg,
+			AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+		}); err != nil {
 			slog.Error("send download notice", "err", err)
 		}
 	}()
