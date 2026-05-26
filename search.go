@@ -31,10 +31,10 @@ type tpbResult struct {
 }
 
 type searchSession struct {
-	Results     []tpbResult
-	Page        int
-	Query       string
-	Created     time.Time
+	Results []tpbResult
+	Page    int
+	Query   string
+	Created time.Time
 	OwnerUserID string
 }
 
@@ -241,41 +241,33 @@ func handleSearch(s *discordgo.Session, i *discordgo.InteractionCreate, cfg *con
 }
 
 func handleSearchNav(s *discordgo.Session, i *discordgo.InteractionCreate, sessionID string, delta int) {
+	userID := interactionUserID(i)
 	searchSessionsMu.Lock()
 	sess, ok := searchSessions[sessionID]
+	if ok && time.Since(sess.Created) > searchSessionTTL {
+		delete(searchSessions, sessionID)
+		ok = false
+	}
 	var results []tpbResult
 	var page int
 	var query string
+	unauthorized := false
 	if ok {
-		// Check TTL expiry
-		if time.Since(sess.Created) > searchSessionTTL {
-			delete(searchSessions, sessionID)
-			ok = false
-		} else if sess.OwnerUserID != interactionUserID(i) {
-			// Check ownership
-			searchSessionsMu.Unlock()
-			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content: "You don't have permission to use this search session.",
-					Flags:   discordgo.MessageFlagsEphemeral,
-				},
-			})
-			return
+		if userID != sess.OwnerUserID {
+			unauthorized = true
+		} else {
+			totalPages := (len(sess.Results) + searchPageSize - 1) / searchPageSize
+			newPage := sess.Page + delta
+			if newPage < 0 {
+				newPage = 0
+			} else if newPage >= totalPages {
+				newPage = totalPages - 1
+			}
+			sess.Page = newPage
+			results = sess.Results
+			page = sess.Page
+			query = sess.Query
 		}
-	}
-	if ok {
-		totalPages := (len(sess.Results) + searchPageSize - 1) / searchPageSize
-		newPage := sess.Page + delta
-		if newPage < 0 {
-			newPage = 0
-		} else if newPage >= totalPages {
-			newPage = totalPages - 1
-		}
-		sess.Page = newPage
-		results = sess.Results
-		page = sess.Page
-		query = sess.Query
 	}
 	searchSessionsMu.Unlock()
 
@@ -284,6 +276,16 @@ func handleSearchNav(s *discordgo.Session, i *discordgo.InteractionCreate, sessi
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
 				Content: "Search session expired. Run `/search` again.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	if unauthorized {
+		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Only the user who started this search can use these controls.",
 				Flags:   discordgo.MessageFlagsEphemeral,
 			},
 		})
@@ -312,32 +314,23 @@ func handleSearchDownload(s *discordgo.Session, i *discordgo.InteractionCreate, 
 
 	searchSessionsMu.Lock()
 	sess, ok := searchSessions[sessionID]
+	if ok && time.Since(sess.Created) > searchSessionTTL {
+		delete(searchSessions, sessionID)
+		ok = false
+	}
 	var result tpbResult
+	unauthorized := false
 	if ok {
-		// Check TTL expiry
-		if time.Since(sess.Created) > searchSessionTTL {
-			delete(searchSessions, sessionID)
-			ok = false
-		} else if sess.OwnerUserID != interactionUserID(i) {
-			// Check ownership
-			searchSessionsMu.Unlock()
-			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content: "You don't have permission to use this search session.",
-					Flags:   discordgo.MessageFlagsEphemeral,
-				},
-			})
-			return
-		} else if localIdx < 0 {
-			// Reject negative indices
-			ok = false
+		if interactionUserID(i) != sess.OwnerUserID {
+			unauthorized = true
 		} else {
 			globalIdx := sess.Page*searchPageSize + localIdx
-			if globalIdx < 0 || globalIdx >= len(sess.Results) {
+			if localIdx < 0 || globalIdx < 0 {
 				ok = false
-			} else {
+			} else if globalIdx < len(sess.Results) {
 				result = sess.Results[globalIdx]
+			} else {
+				ok = false
 			}
 		}
 	}
@@ -348,6 +341,16 @@ func handleSearchDownload(s *discordgo.Session, i *discordgo.InteractionCreate, 
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
 				Content: "Search session expired. Run `/search` again.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+	if unauthorized {
+		_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Only the user who started this search can use these controls.",
 				Flags:   discordgo.MessageFlagsEphemeral,
 			},
 		})
@@ -388,8 +391,10 @@ func handleSearchDownload(s *discordgo.Session, i *discordgo.InteractionCreate, 
 		}
 
 		if _, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
-			Content:         msg,
-			AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+			Content: msg,
+			AllowedMentions: &discordgo.MessageAllowedMentions{
+				Parse: []discordgo.AllowedMentionType{},
+			},
 		}); err != nil {
 			slog.Error("send download notice", "err", err)
 		}
