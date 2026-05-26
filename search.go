@@ -134,7 +134,7 @@ func buildSearchEmbed(results []tpbResult, page int, query string) *discordgo.Me
 		Description: strings.TrimRight(desc.String(), "\n"),
 		Color:       0x5865F2,
 		Footer: &discordgo.MessageEmbedFooter{
-			Text: fmt.Sprintf("Page %d/%d · %d results · The Pirate Bay", page+1, totalPages, total),
+			Text: fmt.Sprintf("Page %d/%d · %d results · tpb", page+1, totalPages, total),
 		},
 		Timestamp: time.Now().Format(time.RFC3339),
 	}
