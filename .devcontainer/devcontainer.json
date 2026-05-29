@@ -1,0 +1,31 @@
+{
+  "name": "listen-go",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspaces/listen",
+  "runArgs": [
+    "--init"
+  ],
+  "mounts": [
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  ],
+  "postCreateCommand": "go mod download",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "editor.formatOnSave": true,
+        "go.toolsManagement.autoUpdate": true,
+        "go.useLanguageServer": true,
+        "[go]": {
+          "editor.defaultFormatter": "golang.go"
+        }
+      },
+      "extensions": [
+        "golang.go",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}
