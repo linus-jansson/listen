@@ -126,6 +126,8 @@ var slashCommands = []*discordgo.ApplicationCommand{
 	},
 }
 
+const downloadsRefreshButtonID = "downloads:refresh"
+
 func setupLogging() {
 	level := slog.LevelInfo
 	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
@@ -215,6 +217,8 @@ func main() {
 			slog.Info("component", "id", data.CustomID, "user", interactionUser(i))
 			if strings.HasPrefix(data.CustomID, "srch_") {
 				handleSearchComponent(s, i, docker, cfg)
+			} else if data.CustomID == downloadsRefreshButtonID {
+				handleDownloadsRefresh(s, i, docker)
 			}
 		}
 	})
@@ -564,20 +568,66 @@ func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docke
 		slog.Error("defer response", "err", err)
 		return
 	}
+	editDownloadsResponse(s, i, docker)
+}
 
-	editContent := func(content string) {
-		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
-			slog.Error("edit response", "err", err)
-		}
+func handleDownloadsRefresh(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client) {
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	}); err != nil {
+		slog.Error("defer refresh response", "err", err)
+		return
 	}
-	editEmbed := func(e *discordgo.MessageEmbed) {
-		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Embeds: &[]*discordgo.MessageEmbed{e},
-		}); err != nil {
-			slog.Error("edit response", "err", err)
+	editDownloadsResponse(s, i, docker)
+}
+
+func editDownloadsResponse(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client) {
+	embed, content, err := buildDownloadsEmbed(docker)
+	components := []discordgo.MessageComponent{downloadsRefreshButtonRow()}
+	if err != nil {
+		msg := fmt.Sprintf("Failed to list downloads: %v", err)
+		if _, editErr := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content:    &msg,
+			Embeds:     &[]*discordgo.MessageEmbed{},
+			Components: &components,
+		}); editErr != nil {
+			slog.Error("edit response", "err", editErr)
 		}
+		return
 	}
 
+	if content != "" {
+		if _, editErr := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content:    &content,
+			Embeds:     &[]*discordgo.MessageEmbed{},
+			Components: &components,
+		}); editErr != nil {
+			slog.Error("edit response", "err", editErr)
+		}
+		return
+	}
+
+	empty := ""
+	if _, editErr := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content:    &empty,
+		Embeds:     &[]*discordgo.MessageEmbed{embed},
+		Components: &components,
+	}); editErr != nil {
+		slog.Error("edit response", "err", editErr)
+	}
+}
+
+func downloadsRefreshButtonRow() discordgo.MessageComponent {
+	return discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+		discordgo.Button{
+			CustomID: downloadsRefreshButtonID,
+			Label:    "Refresh",
+			Style:    discordgo.PrimaryButton,
+		},
+	}}
+}
+
+func buildDownloadsEmbed(docker *client.Client) (*discordgo.MessageEmbed, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -587,13 +637,11 @@ func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docke
 	})
 	if err != nil {
 		slog.Error("list downloads", "err", err)
-		editContent(fmt.Sprintf("Failed to list downloads: %v", err))
-		return
+		return nil, "", err
 	}
 	slog.Info("downloads listed", "count", len(list))
 	if len(list) == 0 {
-		editContent("No downloads yet.")
-		return
+		return nil, "No downloads yet.", nil
 	}
 
 	sort.Slice(list, func(a, b int) bool { return list[a].Created > list[b].Created })
@@ -629,7 +677,7 @@ func handleDownloads(s *discordgo.Session, i *discordgo.InteractionCreate, docke
 			Text: fmt.Sprintf("…and %d more not shown", len(list)-maxRows),
 		}
 	}
-	editEmbed(embed)
+	return embed, "", nil
 }
 
 func handleClear(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client) {
