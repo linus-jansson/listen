@@ -122,6 +122,11 @@ var slashCommands = []*discordgo.ApplicationCommand{
 				Description: "What to search for",
 				Required:    true,
 			},
+			{
+				Type:        discordgo.ApplicationCommandOptionBoolean,
+				Name:        "show_unsafe",
+				Description: "Include very old results and results with a high potential virus score",
+			},
 		},
 	},
 }
@@ -203,8 +208,17 @@ func main() {
 				link := data.Options[0].StringValue()
 				handleMagnet(s, i, docker, cfg, link)
 			case "search":
-				query := data.Options[0].StringValue()
-				handleSearch(s, i, cfg, query)
+				var query string
+				var showUnsafe bool
+				for _, opt := range data.Options {
+					switch opt.Name {
+					case "query":
+						query = opt.StringValue()
+					case "show_unsafe":
+						showUnsafe = opt.BoolValue()
+					}
+				}
+				handleSearch(s, i, cfg, query, showUnsafe)
 			case "downloads":
 				handleDownloads(s, i, docker)
 			case "clear":

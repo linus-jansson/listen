@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ const (
 	searchPageSize   = 5
 	searchSessionTTL = 15 * time.Minute
 	tpbAPIBase       = "https://apibay.org"
+	knabenAPIBase    = "https://api.knaben.org"
 )
 
 type tpbResult struct {
@@ -34,6 +36,7 @@ type searchSession struct {
 	Results []tpbResult
 	Page    int
 	Query   string
+	Source  string
 	Created time.Time
 	OwnerUserID string
 }
@@ -58,7 +61,20 @@ func pruneSearchSessions() {
 	}
 }
 
-func searchTorrents(query string) ([]tpbResult, error) {
+func searchTorrents(query string, showUnsafe bool) ([]tpbResult, string, error) {
+	results, knabenErr := searchKnaben(query, showUnsafe)
+	if knabenErr == nil {
+		return results, "knaben", nil
+	}
+	slog.Warn("knaben search failed; falling back to apibay", "query", query, "err", knabenErr)
+	results, tpbErr := searchTPB(query)
+	if tpbErr != nil {
+		return nil, "", fmt.Errorf("knaben: %v; apibay: %w", knabenErr, tpbErr)
+	}
+	return results, "tpb", nil
+}
+
+func searchTPB(query string) ([]tpbResult, error) {
 	u := tpbAPIBase + "/q.php?q=" + url.QueryEscape(query) + "&cat=0"
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	resp, err := httpClient.Get(u)
@@ -75,6 +91,61 @@ func searchTorrents(query string) ([]tpbResult, error) {
 	// TPB returns a single sentinel entry when there are no results
 	if len(results) == 1 && results[0].InfoHash == "0000000000000000000000000000000000000000" {
 		return nil, nil
+	}
+	return results, nil
+}
+
+func searchKnaben(query string, showUnsafe bool) ([]tpbResult, error) {
+	// no search_field: match the query against all fields; "100%" requires
+	// every term to match so seeder-ordering can't surface unrelated hits
+	payload, err := json.Marshal(map[string]any{
+		"search_type":     "100%",
+		"query":           query,
+		"size":            50,
+		"hide_unsafe":     !showUnsafe,
+		"order_by":        "seeders",
+		"order_direction": "desc",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Post(knabenAPIBase+"/v1", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %s", resp.Status)
+	}
+
+	var body struct {
+		Hits []struct {
+			Title   string `json:"title"`
+			Hash    string `json:"hash"`
+			Seeders int    `json:"seeders"`
+			Peers   int    `json:"peers"`
+			Bytes   int64  `json:"bytes"`
+		} `json:"hits"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	var results []tpbResult
+	for _, h := range body.Hits {
+		// some indexers only provide a .torrent link; we need an infohash for the magnet
+		if len(h.Hash) != 40 {
+			continue
+		}
+		results = append(results, tpbResult{
+			Name:     h.Title,
+			InfoHash: h.Hash,
+			Seeders:  strconv.Itoa(h.Seeders),
+			Leechers: strconv.Itoa(h.Peers),
+			Size:     strconv.FormatInt(h.Bytes, 10),
+		})
 	}
 	return results, nil
 }
@@ -112,7 +183,7 @@ func formatBytes(s string) string {
 	}
 }
 
-func buildSearchEmbed(results []tpbResult, page int, query string) *discordgo.MessageEmbed {
+func buildSearchEmbed(results []tpbResult, page int, query, source string) *discordgo.MessageEmbed {
 	total := len(results)
 	totalPages := (total + searchPageSize - 1) / searchPageSize
 
@@ -135,7 +206,7 @@ func buildSearchEmbed(results []tpbResult, page int, query string) *discordgo.Me
 		Description: strings.TrimRight(desc.String(), "\n"),
 		Color:       0x5865F2,
 		Footer: &discordgo.MessageEmbedFooter{
-			Text: fmt.Sprintf("Page %d/%d · %d results · tpb", page+1, totalPages, total),
+			Text: fmt.Sprintf("Page %d/%d · %d results · %s", page+1, totalPages, total, source),
 		},
 		Timestamp: time.Now().Format(time.RFC3339),
 	}
@@ -197,7 +268,7 @@ func buildSearchComponents(results []tpbResult, page int, sessionID string) []di
 	return rows
 }
 
-func handleSearch(s *discordgo.Session, i *discordgo.InteractionCreate, cfg *config, query string) {
+func handleSearch(s *discordgo.Session, i *discordgo.InteractionCreate, cfg *config, query string, showUnsafe bool) {
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	}); err != nil {
@@ -211,10 +282,10 @@ func handleSearch(s *discordgo.Session, i *discordgo.InteractionCreate, cfg *con
 		}
 	}
 
-	results, err := searchTorrents(query)
+	results, source, err := searchTorrents(query, showUnsafe)
 	if err != nil {
 		slog.Error("search torrents", "query", query, "err", err)
-		editContent(fmt.Sprintf("Search failed: %v", err))
+		editContent("Search failed: all torrent search services are currently unreachable. Try again later.")
 		return
 	}
 	if len(results) == 0 {
@@ -225,12 +296,12 @@ func handleSearch(s *discordgo.Session, i *discordgo.InteractionCreate, cfg *con
 	go pruneSearchSessions()
 
 	sessionID := newSessionID()
-	sess := &searchSession{Results: results, Page: 0, Query: query, Created: time.Now(), OwnerUserID: interactionUserID(i)}
+	sess := &searchSession{Results: results, Page: 0, Query: query, Source: source, Created: time.Now(), OwnerUserID: interactionUserID(i)}
 	searchSessionsMu.Lock()
 	searchSessions[sessionID] = sess
 	searchSessionsMu.Unlock()
 
-	embed := buildSearchEmbed(results, 0, query)
+	embed := buildSearchEmbed(results, 0, query, source)
 	components := buildSearchComponents(results, 0, sessionID)
 	if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Embeds:     &[]*discordgo.MessageEmbed{embed},
@@ -250,7 +321,7 @@ func handleSearchNav(s *discordgo.Session, i *discordgo.InteractionCreate, sessi
 	}
 	var results []tpbResult
 	var page int
-	var query string
+	var query, source string
 	unauthorized := false
 	if ok {
 		if userID != sess.OwnerUserID {
@@ -267,6 +338,7 @@ func handleSearchNav(s *discordgo.Session, i *discordgo.InteractionCreate, sessi
 			results = sess.Results
 			page = sess.Page
 			query = sess.Query
+			source = sess.Source
 		}
 	}
 	searchSessionsMu.Unlock()
@@ -292,7 +364,7 @@ func handleSearchNav(s *discordgo.Session, i *discordgo.InteractionCreate, sessi
 		return
 	}
 
-	embed := buildSearchEmbed(results, page, query)
+	embed := buildSearchEmbed(results, page, query, source)
 	components := buildSearchComponents(results, page, sessionID)
 	_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
