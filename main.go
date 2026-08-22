@@ -30,6 +30,7 @@ const (
 	labelBot     = "listen.bot"
 	labelName    = "listen.name"
 	labelCreated = "listen.created"
+	labelTool    = "listen.tool"
 	labelValue   = "magnet"
 )
 
@@ -50,6 +51,7 @@ type config struct {
 	guildID          string
 	downloadHostPath string
 	downloaderImage  string
+	mediaImage       string
 	btStopTimeout    int
 	btTrackers       string
 }
@@ -61,6 +63,7 @@ func loadConfig() (*config, error) {
 		guildID:          os.Getenv("DISCORD_GUILD_ID"),
 		downloadHostPath: os.Getenv("DOWNLOAD_HOST_PATH"),
 		downloaderImage:  os.Getenv("DOWNLOADER_IMAGE"),
+		mediaImage:       os.Getenv("MEDIA_DOWNLOADER_IMAGE"),
 		btStopTimeout:    600,
 		btTrackers:       defaultTrackers,
 	}
@@ -75,6 +78,9 @@ func loadConfig() (*config, error) {
 	}
 	if c.downloaderImage == "" {
 		c.downloaderImage = "listen-downloader:latest"
+	}
+	if c.mediaImage == "" {
+		c.mediaImage = "listen-media-downloader:latest"
 	}
 	if v := os.Getenv("BT_STOP_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -111,6 +117,30 @@ var slashCommands = []*discordgo.ApplicationCommand{
 	{
 		Name:        "restart",
 		Description: "Restart all failed downloads (resumes from partial files)",
+	},
+	{
+		Name:        "video",
+		Description: "Download videos or audio with yt-dlp",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        "urls",
+				Description: "One or more video/page URLs, separated by spaces or newlines",
+				Required:    true,
+			},
+		},
+	},
+	{
+		Name:        "gallery",
+		Description: "Download image galleries with gallery-dl",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionString,
+				Name:        "urls",
+				Description: "One or more gallery URLs, separated by spaces or newlines",
+				Required:    true,
+			},
+		},
 	},
 	{
 		Name:        "search",
@@ -207,6 +237,10 @@ func main() {
 			case "magnet":
 				link := data.Options[0].StringValue()
 				handleMagnet(s, i, docker, cfg, link)
+			case "video":
+				handleMedia(s, i, docker, cfg, toolYtdlp, data.Options[0].StringValue())
+			case "gallery":
+				handleMedia(s, i, docker, cfg, toolGalleryDL, data.Options[0].StringValue())
 			case "search":
 				var query string
 				var showUnsafe bool
@@ -334,9 +368,21 @@ func handleMagnet(s *discordgo.Session, i *discordgo.InteractionCreate, docker *
 		return
 	}
 
-	jobs := make([]*magnetJob, len(magnets))
+	slog.Info("magnet command", "count", len(magnets))
+	specs := make([]downloadSpec, len(magnets))
 	for idx, m := range magnets {
-		jobs[idx] = &magnetJob{name: magnetName(m), status: "queued"}
+		specs[idx] = aria2Spec(cfg, m)
+	}
+	runJobsAndNotify(s, i, docker, cfg, specs)
+}
+
+// runJobsAndNotify runs one container per spec concurrently, live-updating the
+// deferred interaction response with per-job status, then posts a completion
+// notice in the channel. The interaction must already be deferred.
+func runJobsAndNotify(s *discordgo.Session, i *discordgo.InteractionCreate, docker *client.Client, cfg *config, specs []downloadSpec) {
+	jobs := make([]*magnetJob, len(specs))
+	for idx, spec := range specs {
+		jobs[idx] = &magnetJob{name: spec.name, status: "queued"}
 	}
 
 	var mu sync.Mutex
@@ -359,21 +405,20 @@ func handleMagnet(s *discordgo.Session, i *discordgo.InteractionCreate, docker *
 		render()
 	}
 
-	slog.Info("magnet command", "count", len(magnets))
 	render()
 
 	var wg sync.WaitGroup
-	for idx, m := range magnets {
+	for idx, spec := range specs {
 		wg.Add(1)
-		go func(idx int, m string) {
+		go func(idx int, spec downloadSpec) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 			defer cancel()
 
-			name := jobs[idx].name
+			name := spec.name
 			set(idx, "starting…", false, false)
 			start := time.Now()
-			exitCode, logs, err := runDownloader(ctx, docker, cfg, m)
+			exitCode, logs, err := runContainer(ctx, docker, cfg, spec)
 			switch {
 			case err != nil:
 				slog.Error("download error", "err", err, "name", name)
@@ -386,7 +431,7 @@ func handleMagnet(s *discordgo.Session, i *discordgo.InteractionCreate, docker *
 				slog.Warn("download exited non-zero", "name", name, "exit_code", exitCode)
 				set(idx, fmt.Sprintf("failed (exit %d): %s", exitCode, lastNonEmptyLine(logs)), true, false)
 			}
-		}(idx, m)
+		}(idx, spec)
 	}
 	wg.Wait()
 
@@ -449,39 +494,64 @@ func lastNonEmptyLine(s string) string {
 	return ""
 }
 
+// downloadSpec describes one container to run: which image, which arguments,
+// and how it should show up in /downloads.
+type downloadSpec struct {
+	image string
+	cmd   []string
+	name  string
+	tool  string
+}
+
+// aria2Spec builds the aria2c invocation for a magnet link.
+func aria2Spec(cfg *config, magnet string) downloadSpec {
+	return downloadSpec{
+		image: cfg.downloaderImage,
+		cmd: []string{
+			"--seed-time=0",
+			fmt.Sprintf("--bt-stop-timeout=%d", cfg.btStopTimeout),
+			"--summary-interval=10",
+			"--enable-color=false",
+			"--enable-dht=true",
+			"--enable-dht6=true",
+			"--bt-enable-lpd=true",
+			"--enable-peer-exchange=true",
+			"--bt-tracker=" + cfg.btTrackers,
+			"-d", "/downloads",
+			magnet,
+		},
+		name: magnetName(magnet),
+		tool: toolAria2,
+	}
+}
+
+// runDownloader downloads a magnet link with aria2c.
 func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet string) (int64, string, error) {
-	if _, err := cli.ImageInspect(ctx, cfg.downloaderImage); err != nil {
-		slog.Debug("downloader image not present locally; attempting pull", "image", cfg.downloaderImage)
+	return runContainer(ctx, cli, cfg, aria2Spec(cfg, magnet))
+}
+
+func runContainer(ctx context.Context, cli *client.Client, cfg *config, spec downloadSpec) (int64, string, error) {
+	if _, err := cli.ImageInspect(ctx, spec.image); err != nil {
+		slog.Debug("downloader image not present locally; attempting pull", "image", spec.image)
 		pullCtx, pullCancel := context.WithTimeout(ctx, 2*time.Minute)
-		if rc, perr := cli.ImagePull(pullCtx, cfg.downloaderImage, image.PullOptions{}); perr == nil {
+		if rc, perr := cli.ImagePull(pullCtx, spec.image, image.PullOptions{}); perr == nil {
 			_, _ = io.Copy(io.Discard, rc)
 			_ = rc.Close()
 		} else {
-			slog.Debug("image pull failed (expected for locally-built images)", "image", cfg.downloaderImage, "err", perr)
+			slog.Debug("image pull failed (expected for locally-built images)", "image", spec.image, "err", perr)
 		}
 		pullCancel()
 	}
 
 	resp, err := cli.ContainerCreate(ctx,
 		&container.Config{
-			Image: cfg.downloaderImage,
-			Cmd: []string{
-				"--seed-time=0",
-				fmt.Sprintf("--bt-stop-timeout=%d", cfg.btStopTimeout),
-				"--summary-interval=10",
-				"--enable-color=false",
-				"--enable-dht=true",
-				"--enable-dht6=true",
-				"--bt-enable-lpd=true",
-				"--enable-peer-exchange=true",
-				"--bt-tracker=" + cfg.btTrackers,
-				"-d", "/downloads",
-				magnet,
-			},
-			Tty: false,
+			Image: spec.image,
+			Cmd:   spec.cmd,
+			Tty:   false,
 			Labels: map[string]string{
 				labelBot:     labelValue,
-				labelName:    magnetName(magnet),
+				labelName:    spec.name,
+				labelTool:    spec.tool,
 				labelCreated: time.Now().UTC().Format(time.RFC3339),
 			},
 		},
@@ -499,7 +569,7 @@ func runDownloader(ctx context.Context, cli *client.Client, cfg *config, magnet 
 	if err != nil {
 		return 0, "", fmt.Errorf("create container: %w", err)
 	}
-	slog.Info("container created", "id", resp.ID[:12], "image", cfg.downloaderImage)
+	slog.Info("container created", "id", resp.ID[:12], "image", spec.image, "tool", spec.tool)
 
 	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		_ = cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
@@ -674,7 +744,11 @@ func buildDownloadsEmbed(docker *client.Client) (*discordgo.MessageEmbed, string
 		if name == "" {
 			name = "magnet"
 		}
-		status := formatStatus(ctx, docker, c.ID, c.State, c.Status)
+		tool := c.Labels[labelTool]
+		if tool != "" && tool != toolAria2 {
+			name = fmt.Sprintf("[%s] %s", tool, name)
+		}
+		status := formatStatus(ctx, docker, c.ID, c.State, c.Status, tool)
 		if c.State == "running" {
 			running++
 		} else if strings.HasPrefix(c.Status, "Exited (0)") {
@@ -865,9 +939,9 @@ func watchAndNotify(s *discordgo.Session, docker *client.Client, id, name, chann
 	}
 }
 
-func formatStatus(ctx context.Context, cli *client.Client, id, state, statusStr string) string {
+func formatStatus(ctx context.Context, cli *client.Client, id, state, statusStr, tool string) string {
 	if state == "running" {
-		if p := readProgress(ctx, cli, id); p != "" {
+		if p := readProgress(ctx, cli, id, tool); p != "" {
 			return "running — " + p
 		}
 		return "running (starting up)"
@@ -880,7 +954,7 @@ var (
 	metadataRe = regexp.MustCompile(`\[#\w+\s+0B/0B\s+CN:(\d+)\s+SD:\d+\s+DL:\S+\]`)
 )
 
-func readProgress(ctx context.Context, cli *client.Client, id string) string {
+func readProgress(ctx context.Context, cli *client.Client, id, tool string) string {
 	logCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	rc, err := cli.ContainerLogs(logCtx, id, container.LogsOptions{
@@ -897,6 +971,14 @@ func readProgress(ctx context.Context, cli *client.Client, id string) string {
 		return ""
 	}
 	text := out.String() + "\n" + errBuf.String()
+
+	switch tool {
+	case toolYtdlp:
+		return readYtdlpProgress(text)
+	case toolGalleryDL:
+		return readGalleryDLProgress(text)
+	}
+
 	lines := strings.Split(text, "\n")
 	for j := len(lines) - 1; j >= 0; j-- {
 		line := lines[j]
