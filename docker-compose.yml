@@ -24,6 +24,7 @@ services:
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
       DOWNLOAD_HOST_PATH: ${DOWNLOAD_HOST_PATH:?DOWNLOAD_HOST_PATH required}
       DOWNLOADER_IMAGE: ${DOWNLOADER_IMAGE:-listen-downloader:latest}
+      MEDIA_DOWNLOADER_IMAGE: ${MEDIA_DOWNLOADER_IMAGE:-listen-media-downloader:latest}
       BT_STOP_TIMEOUT: ${BT_STOP_TIMEOUT:-}
       BT_TRACKERS: ${BT_TRACKERS:-}
     depends_on:
@@ -38,6 +39,12 @@ services:
     image: listen-downloader:latest
     profiles: ["build-only"]
     command: ["--version"]
+
+  media-downloader:
+    build: ./media-downloader
+    image: listen-media-downloader:latest
+    profiles: ["build-only"]
+    command: ["yt-dlp", "--version"]
 
 networks:
   proxy:
